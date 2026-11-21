@@ -1,0 +1,864 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+
+void main() {
+  runApp(const SpellingWorldApp());
+}
+
+enum AppLang { ps, prs }
+
+enum ErrorType {
+  deletion,
+  insertion,
+  substitution,
+  transposition,
+  homophone,
+  wordJoin,
+  spacing,
+}
+
+class SpellingErrorRecord {
+  final ErrorType type;
+  final String expectedPart;
+  final String actualPart;
+  final String explanation;
+  final String word;
+  int repeatCount;
+
+  SpellingErrorRecord({
+    required this.type,
+    required this.expectedPart,
+    required this.actualPart,
+    required this.explanation,
+    required this.word,
+    this.repeatCount = 1,
+  });
+}
+
+class WordItem {
+  final String id;
+  final AppLang lang;
+  final int grade;
+  final String word;
+  final String meaning;
+  final String sentence;
+  final String missingHint;
+  final List<String> choices;
+  final String topic;
+  final bool offlineAvailable;
+
+  const WordItem({
+    required this.id,
+    required this.lang,
+    required this.grade,
+    required this.word,
+    required this.meaning,
+    required this.sentence,
+    required this.missingHint,
+    required this.choices,
+    required this.topic,
+    this.offlineAvailable = true,
+  });
+}
+
+class SpellingEvaluator {
+  static const List<Set<String>> _psHomophones = [
+    {'س', 'ث', 'ص', 'څ'},
+    {'ز', 'ذ', 'ض', 'ظ', 'ځ'},
+    {'ت', 'ط', 'ټ'},
+    {'د', 'ډ'},
+    {'ر', 'ړ'},
+    {'ن', 'ڼ'},
+    {'ه', 'ح'},
+    {'غ', 'ق'},
+  ];
+
+  static const List<Set<String>> _prsHomophones = [
+    {'س', 'ث', 'ص'},
+    {'ز', 'ذ', 'ض', 'ظ'},
+    {'ت', 'ط'},
+    {'ه', 'ح'},
+    {'غ', 'ق'},
+  ];
+
+  static const Set<String> _protectedSpecialLetters = {
+    'ښ', 'ږ', 'څ', 'ځ', 'ټ', 'ډ', 'ړ', 'ڼ', 'ګ',
+    'ی', 'ي', 'ې', 'ۍ', 'ئ',
+  };
+
+  static String normalizeTech(String input, List<String> techNotes) {
+    var s = input.replaceAll('\u200B', '').replaceAll('\uFEFF', '');
+    if (s.contains('ك')) {
+      s = s.replaceAll('ك', 'ک');
+      techNotes.add('تخنیکي «ك» د معیاري «ک» په بڼه واخیستل شوه.');
+    }
+    if (s.contains('\u064A')) {
+      s = s.replaceAll('\u064A', 'ي');
+      techNotes.add('د کیبورډ «ي» بڼه منظم شوه.');
+    }
+    return s.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  static bool _isHomophone(String a, String b, AppLang lang) {
+    if (a == b) return false;
+    if (_protectedSpecialLetters.contains(a) || _protectedSpecialLetters.contains(b)) {
+      return false;
+    }
+    final groups = lang == AppLang.ps ? _psHomophones : _prsHomophones;
+    for (final g in groups) {
+      if (g.contains(a) && g.contains(b)) return true;
+    }
+    return false;
+  }
+
+  static List<SpellingErrorRecord> evaluate({
+    required String expected,
+    required String actual,
+    required AppLang lang,
+    required List<String> techNotes,
+  }) {
+    final normExp = normalizeTech(expected, []);
+    final normAct = normalizeTech(actual, techNotes);
+    if (normExp == normAct) return [];
+
+    final errors = <SpellingErrorRecord>[];
+
+    if (normExp.replaceAll(' ', '') == normAct.replaceAll(' ', '') && normExp != normAct) {
+      final expWords = normExp.split(' ').length;
+      final actWords = normAct.split(' ').length;
+      errors.add(
+        SpellingErrorRecord(
+          type: expWords != actWords ? ErrorType.wordJoin : ErrorType.spacing,
+          expectedPart: normExp,
+          actualPart: normAct,
+          explanation: expWords != actWords
+              ? 'د کلمو د یوځای یا جلا لیکلو په ترتیب کې تېروتنه شوې.'
+              : 'د کلمو ترمنځ د فاصلو په رعایت کې تېروتنه شوې.',
+          word: expected,
+        ),
+      );
+    }
+
+    final expChars = normExp.runes.map((r) => String.fromCharCode(r)).toList();
+    final actChars = normAct.runes.map((r) => String.fromCharCode(r)).toList();
+
+    int i = 0;
+    int j = 0;
+    while (i < expChars.length || j < actChars.length) {
+      if (i < expChars.length && j < actChars.length && expChars[i] == actChars[j]) {
+        i++;
+        j++;
+        continue;
+      }
+      if (i + 1 < expChars.length &&
+          j + 1 < actChars.length &&
+          expChars[i] == actChars[j + 1] &&
+          expChars[i + 1] == actChars[j]) {
+        errors.add(
+          SpellingErrorRecord(
+            type: ErrorType.transposition,
+            expectedPart: '${expChars[i]}${expChars[i + 1]}',
+            actualPart: '${actChars[j]}${actChars[j + 1]}',
+            explanation: 'د «${expChars[i]}» او «${expChars[i + 1]}» تورو ترتیب بدل شوی.',
+            word: expected,
+          ),
+        );
+        i += 2;
+        j += 2;
+        continue;
+      }
+      if (i < expChars.length &&
+          (j >= actChars.length || (i + 1 < expChars.length && expChars[i + 1] == actChars[j]))) {
+        errors.add(
+          SpellingErrorRecord(
+            type: expChars[i] == ' ' ? ErrorType.spacing : ErrorType.deletion,
+            expectedPart: expChars[i],
+            actualPart: '(ورک)',
+            explanation: expChars[i] == ' '
+                ? 'د کلمو ترمنځ فاصله ورکه ده.'
+                : '«${expChars[i]}» توری حذف شوی دی.',
+            word: expected,
+          ),
+        );
+        i++;
+        continue;
+      }
+      if (j < actChars.length &&
+          (i >= expChars.length || (j + 1 < actChars.length && expChars[i] == actChars[j + 1]))) {
+        errors.add(
+          SpellingErrorRecord(
+            type: actChars[j] == ' ' ? ErrorType.spacing : ErrorType.insertion,
+            expectedPart: '(اضافي)',
+            actualPart: actChars[j],
+            explanation: actChars[j] == ' '
+                ? 'اضافي فاصله لیکل شوې.'
+                : 'اضافي «${actChars[j]}» توری زیات شوی.',
+            word: expected,
+          ),
+        );
+        j++;
+        continue;
+      }
+      if (i < expChars.length && j < actChars.length) {
+        final homo = _isHomophone(expChars[i], actChars[j], lang);
+        errors.add(
+          SpellingErrorRecord(
+            type: homo ? ErrorType.homophone : ErrorType.substitution,
+            expectedPart: expChars[i],
+            actualPart: actChars[j],
+            explanation: homo
+                ? 'د ورته غږ تورو «${expChars[i]}» او «${actChars[j]}» ګډوډي شوې.'
+                : 'د «${expChars[i]}» پر ځای «${actChars[j]}» لیکل شوی.',
+            word: expected,
+          ),
+        );
+        i++;
+        j++;
+      }
+    }
+    return errors;
+  }
+}
+
+class SpellingWorldApp extends StatefulWidget {
+  const SpellingWorldApp({super.key});
+
+  @override
+  State<SpellingWorldApp> createState() => _SpellingWorldAppState();
+}
+
+class _SpellingWorldAppState extends State<SpellingWorldApp> {
+  AppLang _lang = AppLang.ps;
+  String _studentName = 'زده‌کوونکی';
+  int _grade = 3;
+  String _role = 'student'; // student, teacher, parent, admin
+  int _stars = 12;
+  int _medals = 2;
+  int _completedCount = 8;
+  int _correctCount = 6;
+  int _dailyMinutesGoal = 15;
+  bool _isOffline = false;
+  bool _unsyncedChanges = false;
+  String _homeworkText = 'د ښ او ږ غږیزه املا';
+
+  final List<SpellingErrorRecord> _errorLog = [
+    SpellingErrorRecord(
+      type: ErrorType.homophone,
+      expectedPart: 'ښ',
+      actualPart: 'ش',
+      explanation: 'په پښتو کې د «ښوونځی» کلمه په «ښ» لیکل کېږي.',
+      word: 'ښوونځی',
+      repeatCount: 2,
+    ),
+  ];
+
+  final List<WordItem> _wordBank = [
+    const WordItem(
+      id: 'w1',
+      lang: AppLang.ps,
+      grade: 3,
+      word: 'ښوونځی',
+      meaning: 'د زده‌کړې او علم ځای',
+      sentence: 'زه هر سهار ښوونځي ته ځم.',
+      missingHint: 'ښـ ـونځی',
+      choices: ['ښوونځی', 'شووځی', 'ښونځي'],
+      topic: 'ښوونځی او زده‌کړه',
+    ),
+    const WordItem(
+      id: 'w2',
+      lang: AppLang.ps,
+      grade: 3,
+      word: 'مکتب',
+      meaning: 'تعلیمي مرکز',
+      sentence: 'په مکتب کې نوي درسونه لولم.',
+      missingHint: 'مـ ـتب',
+      choices: ['مکتب', 'مکـتب', 'مقتب'],
+      topic: 'ښوونځی او زده‌کړه',
+    ),
+    const WordItem(
+      id: 'w3',
+      lang: AppLang.prs,
+      grade: 3,
+      word: 'کتابخانه',
+      meaning: 'جای نگهداری و مطالعه کتاب‌ها',
+      sentence: 'در کتابخانه با دقت درس می‌خوانم.',
+      missingHint: 'کتابـ ـانه',
+      choices: ['کتابخانه', 'کتاخانه', 'کتابخانی'],
+      topic: 'درس و مطالعه',
+    ),
+  ];
+
+  void _recordError(SpellingErrorRecord rec) {
+    final existing = _errorLog.where((e) => e.word == rec.word && e.type == rec.type).toList();
+    if (existing.isNotEmpty) {
+      existing.first.repeatCount += 1;
+    } else {
+      _errorLog.insert(0, rec);
+    }
+    _unsyncedChanges = true;
+  }
+
+  void _submitAttempt({required String expected, required String actual}) {
+    final notes = <String>[];
+    final errors = SpellingEvaluator.evaluate(
+      expected: expected,
+      actual: actual,
+      lang: _lang,
+      techNotes: notes,
+    );
+    setState(() {
+      _completedCount += 1;
+      _unsyncedChanges = true;
+      if (errors.isEmpty) {
+        _correctCount += 1;
+        _stars += 1;
+        if (_correctCount % 5 == 0) _medals += 1;
+      } else {
+        for (final err in errors) {
+          _recordError(err);
+        }
+      }
+    });
+  }
+
+  String _generateExcelCsvSummary() {
+    final accuracy = _completedCount == 0 ? 0.0 : (_correctCount / _completedCount) * 100;
+    final rows = [
+      ['نوم', 'ټولګی', 'ژبه', 'بشپړ شوي', 'سموالی (%)', 'تېروتنې'],
+      [
+        _studentName,
+        '$_grade',
+        _lang == AppLang.ps ? 'پښتو' : 'دري',
+        '$_completedCount',
+        accuracy.toStringAsFixed(1),
+        '${_errorLog.length}',
+      ],
+    ];
+    return rows.map((r) => r.map((c) => '"$c"').join(',')).join('\n');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filteredWords = _wordBank.where((w) => w.lang == _lang).toList();
+
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'د املا نړۍ - Spelling World',
+      theme: ThemeData(
+        colorSchemeSeed: Colors.orange,
+        useMaterial3: true,
+      ),
+      home: Directionality(
+        textDirection: TextDirection.rtl,
+        child: Scaffold(
+          appBar: AppBar(
+            title: const Text('د املا نړۍ (Spelling World)'),
+            actions: [
+              SegmentedButton<AppLang>(
+                segments: const [
+                  ButtonSegment(value: AppLang.ps, label: Text('پښتو')),
+                  ButtonSegment(value: AppLang.prs, label: Text('دري')),
+                ],
+                selected: {_lang},
+                onSelectionChanged: (v) => setState(() => _lang = v.first),
+              ),
+              const SizedBox(width: 8),
+              PopupMenuButton<String>(
+                initialValue: _role,
+                onSelected: (r) => setState(() => _role = r),
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'student', child: Text('زده‌کوونکی')),
+                  PopupMenuItem(value: 'teacher', child: Text('ښوونکی')),
+                  PopupMenuItem(value: 'parent', child: Text('والدین')),
+                  PopupMenuItem(value: 'admin', child: Text('مدیر (Admin)')),
+                ],
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 10),
+                  child: Icon(Icons.switch_account_rounded),
+                ),
+              ),
+            ],
+          ),
+          body: _buildBody(filteredWords),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBody(List<WordItem> words) {
+    switch (_role) {
+      case 'teacher':
+        return _buildTeacherView();
+      case 'parent':
+        return _buildParentView();
+      case 'admin':
+        return _buildAdminView();
+      default:
+        return _buildStudentView(words);
+    }
+  }
+
+  Widget _buildStudentView(List<WordItem> words) {
+    final accuracy = _completedCount == 0 ? 0.0 : (_correctCount / _completedCount) * 100;
+    final goalProgress = (_completedCount / (_dailyMinutesGoal.clamp(5, 60) / 3)).clamp(0.0, 1.0);
+
+    return DefaultTabController(
+      length: 4,
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          '$_studentName | ټولګی $_grade',
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                        ),
+                        Text('★ $_stars  |  🏅 $_medals'),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Text('کورنۍ دنده: $_homeworkText'),
+                    const SizedBox(height: 6),
+                    LinearProgressIndicator(value: goalProgress),
+                    const SizedBox(height: 6),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text('حالت: ${_isOffline ? "Offline" : "Online"}'),
+                        TextButton.icon(
+                          onPressed: () {
+                            setState(() {
+                              _isOffline = !_isOffline;
+                              if (!_isOffline) _unsyncedChanges = false;
+                            });
+                          },
+                          icon: Icon(_isOffline ? Icons.wifi : Icons.wifi_off),
+                          label: Text(_isOffline ? 'آنلاین او Sync' : 'آفلاین حالت'),
+                        ),
+                      ],
+                    ),
+                    if (_unsyncedChanges)
+                      const Text(
+                        'محلي بدلونونه د همغږۍ لپاره چمتو دي.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const TabBar(
+            isScrollable: true,
+            tabs: [
+              Tab(text: 'غږیزه املا او کلمې'),
+              Tab(text: 'کلمو بشپړول او انتخاب'),
+              Tab(text: 'زما تېروتنې'),
+              Tab(text: 'زما پرمختګ او جایزې'),
+            ],
+          ),
+          Expanded(
+            child: TabBarView(
+              children: [
+                _DictationAndWordTab(
+                  words: words,
+                  onEvaluate: (exp, act) => _submitAttempt(expected: exp, actual: act),
+                ),
+                _GamesTab(
+                  words: words,
+                  onEvaluate: (exp, act) => _submitAttempt(expected: exp, actual: act),
+                ),
+                _ErrorsTab(
+                  errors: _errorLog,
+                  onRetryCorrect: (word) => _submitAttempt(expected: word, actual: word),
+                ),
+                _ProgressAndRewardsTab(
+                  completed: _completedCount,
+                  correct: _correctCount,
+                  accuracy: accuracy,
+                  stars: _stars,
+                  medals: _medals,
+                  errors: _errorLog,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTeacherView() {
+    final hwController = TextEditingController(text: _homeworkText);
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text('د ښوونکي ډشبورډ', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 12),
+        TextField(
+          controller: hwController,
+          decoration: const InputDecoration(
+            labelText: 'د ټولګي کورنۍ دنده',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 10),
+        ElevatedButton(
+          onPressed: () => setState(() => _homeworkText = hwController.text.trim()),
+          child: const Text('کورنۍ دنده ثبت کړئ'),
+        ),
+        const SizedBox(height: 16),
+        Card(
+          child: ListTile(
+            title: Text('زده‌کوونکی: $_studentName'),
+            subtitle: Text(
+              'بشپړ شوي تمرینونه: $_completedCount | سم ځوابونه: $_correctCount | ثبت شوي تېروتنې: ${_errorLog.length}',
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        OutlinedButton.icon(
+          onPressed: () {
+            final csv = _generateExcelCsvSummary();
+            showDialog(
+              context: context,
+              builder: (_) => Directionality(
+                textDirection: TextDirection.rtl,
+                child: AlertDialog(
+                  title: const Text('د Excel/CSV راپور چمتو شو'),
+                  content: SelectableText(csv),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: const Text('بندول'),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+          icon: const Icon(Icons.table_chart),
+          label: const Text('د Excel راپور متن وګورئ'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildParentView() {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text('د والدینو پاڼه', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 12),
+        Text('د ورځني تمرین وخت: $_dailyMinutesGoal دقیقې'),
+        Slider(
+          min: 5,
+          max: 60,
+          divisions: 11,
+          value: _dailyMinutesGoal.toDouble(),
+          onChanged: (v) => setState(() => _dailyMinutesGoal = v.round()),
+        ),
+        const SizedBox(height: 12),
+        const Text('کمزورې کلمې او تېروتنې:', style: TextStyle(fontWeight: FontWeight.bold)),
+        ..._errorLog.map(
+          (e) => Card(
+            child: ListTile(
+              title: Text(e.word),
+              subtitle: Text('${e.explanation} (${e.repeatCount} ځله)'),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Text(
+              _errorLog.isEmpty
+                  ? 'د کورني تمرین وړاندیز: هره ورځ ۵ لنډې جملې په خوښۍ ولیکئ.'
+                  : 'د کورني تمرین وړاندیز: د «${_errorLog.first.word}» په څېر کلمې په ارامه ووایئ او د تورو بڼې ورسره وګورئ.',
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAdminView() {
+    final wordCtrl = TextEditingController();
+    final meaningCtrl = TextEditingController();
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text('د مدیر پاڼه - د کلمو بانک', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 12),
+        TextField(
+          controller: wordCtrl,
+          decoration: const InputDecoration(labelText: 'نوې کلمه', border: OutlineInputBorder()),
+        ),
+        const SizedBox(height: 10),
+        TextField(
+          controller: meaningCtrl,
+          decoration: const InputDecoration(labelText: 'مانا', border: OutlineInputBorder()),
+        ),
+        const SizedBox(height: 10),
+        ElevatedButton(
+          onPressed: () {
+            if (wordCtrl.text.trim().isEmpty) return;
+            setState(() {
+              _wordBank.add(
+                WordItem(
+                  id: 'w_${_wordBank.length + 1}',
+                  lang: _lang,
+                  grade: _grade,
+                  word: wordCtrl.text.trim(),
+                  meaning: meaningCtrl.text.trim().isEmpty ? 'نصابي کلمه' : meaningCtrl.text.trim(),
+                  sentence: 'دا کلمه په جمله کې وکاروئ: ${wordCtrl.text.trim()}.',
+                  missingHint: wordCtrl.text.trim(),
+                  choices: [wordCtrl.text.trim(), 'بېلګه ۱', 'بېلګه ۲'],
+                  topic: 'مدیر اضافه کړې',
+                ),
+              );
+            });
+            wordCtrl.clear();
+            meaningCtrl.clear();
+          },
+          child: const Text('د کلمو بانک ته اضافه کړئ'),
+        ),
+        const SizedBox(height: 16),
+        ..._wordBank.map(
+          (w) => ListTile(
+            title: Text(w.word),
+            subtitle: Text('${w.lang == AppLang.ps ? "پښتو" : "دري"} | ټولګی ${w.grade} | ${w.meaning}'),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _DictationAndWordTab extends StatefulWidget {
+  final List<WordItem> words;
+  final void Function(String expected, String actual) onEvaluate;
+
+  const _DictationAndWordTab({required this.words, required this.onEvaluate});
+
+  @override
+  State<_DictationAndWordTab> createState() => _DictationAndWordTabState();
+}
+
+class _DictationAndWordTabState extends State<_DictationAndWordTab> {
+  int _index = 0;
+  final TextEditingController _input = TextEditingController();
+  String? _resultText;
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.words.isEmpty) {
+      return const Center(child: Text('په دې ژبه کې کلمه نشته.'));
+    }
+    final item = widget.words[_index % widget.words.length];
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('کلمه: ${item.word}', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 4),
+                Text('مانا: ${item.meaning}'),
+                Text('جمله: ${item.sentence}'),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    setState(() => _resultText = 'غږ واورېدل شو: «${item.word}»');
+                  },
+                  icon: const Icon(Icons.volume_up),
+                  label: const Text('غږیزه املا واورئ'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _input,
+          decoration: const InputDecoration(
+            labelText: 'کلمه دلته ولیکئ',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: ElevatedButton(
+                onPressed: () {
+                  final typed = _input.text.trim();
+                  if (typed.isEmpty) return;
+                  widget.onEvaluate(item.word, typed);
+                  setState(() {
+                    _resultText = typed == item.word
+                        ? 'آفرین! سمه املا ده (+۱ ستوری).'
+                        : 'سمه بڼه «${item.word}» ده. بیا تمرین وکړئ.';
+                  });
+                },
+                child: const Text('ارزونه وکړئ'),
+              ),
+            ),
+            const SizedBox(width: 10),
+            OutlinedButton(
+              onPressed: () {
+                _input.clear();
+                setState(() {
+                  _index += 1;
+                  _resultText = null;
+                });
+              },
+              child: const Text('بل کلمه'),
+            ),
+          ],
+        ),
+        if (_resultText != null) ...[
+          const SizedBox(height: 12),
+          Text(_resultText!, style: const TextStyle(fontWeight: FontWeight.bold)),
+        ],
+      ],
+    );
+  }
+}
+
+class _GamesTab extends StatelessWidget {
+  final List<WordItem> words;
+  final void Function(String expected, String actual) onEvaluate;
+
+  const _GamesTab({required this.words, required this.onEvaluate});
+
+  @override
+  Widget build(BuildContext context) {
+    if (words.isEmpty) return const Center(child: Text('لوبه موجوده نه ده.'));
+    final item = words.first;
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text('د کلمو بشپړول او د سمې کلمې انتخاب', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Text('بشپړه کړئ: ${item.missingHint}'),
+        const SizedBox(height: 12),
+        ...item.choices.map(
+          (choice) => Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: ElevatedButton(
+              onPressed: () {
+                onEvaluate(item.word, choice);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(choice == item.word ? 'سم انتخاب شو!' : 'سمه بڼه «${item.word}» ده.'),
+                  ),
+                );
+              },
+              child: Text(choice),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ErrorsTab extends StatelessWidget {
+  final List<SpellingErrorRecord> errors;
+  final void Function(String word) onRetryCorrect;
+
+  const _ErrorsTab({required this.errors, required this.onRetryCorrect});
+
+  @override
+  Widget build(BuildContext context) {
+    if (errors.isEmpty) {
+      return const Center(child: Text('تر اوسه کومه ثبت شوې تېروتنه نشته.'));
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: errors.length,
+      itemBuilder: (context, idx) {
+        final e = errors[idx];
+        return Card(
+          child: ListTile(
+            title: Text(e.word, style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text('${e.explanation} | تکرار: ${e.repeatCount}'),
+            trailing: TextButton(
+              onPressed: () {
+                onRetryCorrect(e.word);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('«${e.word}» په سمه توګه تمرین شوه.')),
+                );
+              },
+              child: const Text('بیا تمرین'),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _ProgressAndRewardsTab extends StatelessWidget {
+  final int completed;
+  final int correct;
+  final double accuracy;
+  final int stars;
+  final int medals;
+  final List<SpellingErrorRecord> errors;
+
+  const _ProgressAndRewardsTab({
+    required this.completed,
+    required this.correct,
+    required this.accuracy,
+    required this.stars,
+    required this.medals,
+    required this.errors,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final jsonSummary = jsonEncode({
+      'completed_exercises': completed,
+      'correct_answers': correct,
+      'accuracy_percent': double.parse(accuracy.toStringAsFixed(1)),
+      'stars': stars,
+      'medals': medals,
+      'recorded_errors': errors.length,
+    });
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('بشپړ شوي تمرینونه: $completed'),
+                Text('د سم ځوابونو سلنه: ${accuracy.toStringAsFixed(1)}%'),
+                Text('ستوري: $stars | مډالونه: $medals'),
+                const SizedBox(height: 8),
+                SelectableText('د پرمختګ لنډیز: $jsonSummary'),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
